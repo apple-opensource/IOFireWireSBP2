@@ -33,7 +33,9 @@
 
 enum
 {
-    kIOFWSBP2FailsOnAckBusy = (1 << 0)
+    kIOFWSBP2FailsOnAckBusy = (1 << 0),
+	kIOFWSBP2FailsOnBusResetsDuringIO = (1 << 1),
+	kIOFWSBP2DontUsePTPacketLimit = (1 << 2)
 };
 
 /*!
@@ -61,12 +63,37 @@ protected:
         kFirmwareRevKey	 			= 0x3c,
         kLUNKey						= 0x14,
         kLUNDirectoryKey			= 0xd4,
-        kManagementAgentOffsetKey	= 0x54
+        kManagementAgentOffsetKey	= 0x54,
+		kUnitCharacteristicsKey 	= 0x3A,
+		kRevisionKey				= 0x21,
+		kFastStartKey				= 0x3E
     };
 
+    typedef struct
+    {
+		UInt32 cmdSpecID; 
+		UInt32 cmdSet;
+		UInt32 vendorID;
+		UInt32 softwareRev;
+		UInt32 firmwareRev; 
+		UInt32 lun;
+		UInt32 devType;
+		UInt32 unitCharacteristics;
+		UInt32 managementOffset;
+		UInt32 revision;
+		bool fastStartSupported;
+		UInt32 fastStart;
+    } LUNInfo;
+	
     // reserved for future use
-    struct ExpansionData { };
-    ExpansionData *reserved; 
+    struct ExpansionData 
+	{
+		bool				fStarted;
+		OSArray *			fPendingMgtAgentCommands ;
+		UInt32				fNumberPendingMgtAgentOrbs;
+		UInt32				fNumLUNs;
+	};
+    ExpansionData * fExpansionData; 
     
 	/////////////////////////////////////////
 	// private fields
@@ -76,21 +103,20 @@ protected:
     IOFireWireUnit * 	fProviderUnit;
     UInt32				fFlags;
     
+	IOFireWireController * fControl;
+	
+	UInt32 				fIOCriticalSectionCount;
+	
 	/////////////////////////////////////////
 	// private internals
-	
+
+    virtual void free( void );	
     virtual IOReturn message( 	UInt32 type, 
 								IOService * provider,
 								void * argument = 0);
     
     virtual void scanForLUNs( void );
-    IOReturn IOFireWireSBP2Target::createLUN( 	UInt32 cmdSpecID, 
-												UInt32 cmdSet, 
-												UInt32 vendorID, 
-												UInt32 softwareRev,
-												UInt32 firmwareRev, 
-												UInt32 lun, 
-												UInt32 devType );
+    IOReturn createLUN( LUNInfo * info );
 
 public:
 
@@ -168,6 +194,18 @@ public:
 
 protected:
     virtual void configurePhysicalFilter( void );
+
+public:
+    virtual void clearTargetFlags( UInt32 flags );
+	virtual IOReturn beginIOCriticalSection( void );
+	virtual void endIOCriticalSection( void );
+
+    virtual bool finalize( IOOptionBits options );
+    
+    IOReturn 	synchMgmtAgentAccess( IOFWCommand * mgmtOrbCommand );
+	void		completeMgmtAgentAccess( );
+	void 		clearMgmtAgentAccess( );
+	void		cancelMgmtAgentAccess( IOFWCommand * mgmtOrbCommand );
 
 protected:
 

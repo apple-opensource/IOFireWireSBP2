@@ -36,6 +36,7 @@ extern const OSSymbol *gCommand_Set_Revision_Symbol;
 extern const OSSymbol *gIOUnit_Symbol;
 extern const OSSymbol *gFirmware_Revision_Symbol;
 extern const OSSymbol *gDevice_Type_Symbol;
+extern const OSSymbol *gGUID_Symbol;
 
 const OSSymbol *gDiagnostics_Symbol;
 
@@ -62,7 +63,7 @@ bool IOFireWireSBP2LUN::attach(IOService *provider)
 	fORBSet 		= NULL;
 	fORBSetIterator = NULL;
 	
-    FWKLOG( ( "IOFireWireSBP2LUN : attach\n" ) );
+    FWKLOG( ( "IOFireWireSBP2LUN<%p> : attach\n", this ) );
 	
 	//
 	// attach to provider
@@ -77,6 +78,7 @@ bool IOFireWireSBP2LUN::attach(IOService *provider)
 	
 	if( status == kIOReturnSuccess )
 	{
+		fProviderTarget->retain();
 		if( !IOService::attach(provider) )
         	status = kIOReturnError;
 	}
@@ -170,19 +172,30 @@ bool IOFireWireSBP2LUN::attach(IOService *provider)
     return (status == kIOReturnSuccess);
 }
 
+// finalize
+//
+//
+
+bool IOFireWireSBP2LUN::finalize( IOOptionBits options )
+{
+	FWKLOG( ( "IOFireWireSBP2LUN<%p> : finalize\n", this ) );
+
+	return IOService::finalize( options );
+}
+
 //
 // free
 //
 
 void IOFireWireSBP2LUN::free( void )
 {
-	FWKLOG( ( "IOFireWireSBP2LUN : free\n" ) );
-	
+	FWKLOG( ( "IOFireWireSBP2LUN<%p> : free\n", this ) );
+
 	//
 	// free unreleased orbs
 	//
 	
-	flushAllManagementORBs();
+//	flushAllManagementORBs();
 		
 	if( fORBSetIterator )			
 		fORBSetIterator->release();
@@ -216,10 +229,12 @@ void IOFireWireSBP2LUN::free( void )
 		fGate = NULL;
 	}
 	
-	//
-	// free super
-	//
-	
+	if( fProviderTarget )
+	{
+		fProviderTarget->release();
+		fProviderTarget = NULL;
+	}
+			
 	IOService::free();
 }
 
@@ -269,7 +284,7 @@ IOReturn IOFireWireSBP2LUN::executeFlushAllMgmtORBs( void )
 
 bool IOFireWireSBP2LUN::handleOpen( IOService * forClient, IOOptionBits options, void * arg )
 {
-    FWKLOG(( "IOFireWireSBP2LUN %d : handleOpen\n", fLUNumber ));
+    FWKLOG(( "IOFireWireSBP2LUN<%p> (%d) : handleOpen\n", this, fLUNumber ));
 	
 	bool ok = false;
 	
@@ -285,7 +300,7 @@ bool IOFireWireSBP2LUN::handleOpen( IOService * forClient, IOOptionBits options,
 
 void IOFireWireSBP2LUN::handleClose( IOService * forClient, IOOptionBits options )
 {
-    FWKLOG(( "IOFireWireSBP2LUN %d : handleClose\n", fLUNumber ));
+    FWKLOG(( "IOFireWireSBP2LUN<%p> (%d) : handleClose\n", this, fLUNumber ));
 	
 	if( isOpen( forClient ) )
 	{
@@ -311,18 +326,19 @@ IOReturn IOFireWireSBP2LUN::message( UInt32 type, IOService *nub, void *arg )
         switch (type)
         {
             case kIOMessageServiceIsTerminated:
-                FWKLOG( ( "IOFireWireSBP2LUN : kIOMessageServiceIsTerminated\n" ) );
+				terminateNotify();
+                FWKLOG( ( "IOFireWireSBP2LUN<%p> : kIOMessageServiceIsTerminated\n", this ) );
                 res = kIOReturnSuccess;
                 break;
 
             case kIOMessageServiceIsSuspended:
-                FWKLOG( ( "IOFireWireSBP2LUN : kIOMessageServiceIsSuspended\n" ) );
+				FWKLOG( ( "IOFireWireSBP2LUN<%p> : kIOMessageServiceIsSuspended\n", this ) );
                 suspendedNotify();
                 res = kIOReturnSuccess;
                 break;
 
             case kIOMessageServiceIsResumed:
-                FWKLOG( ( "IOFireWireSBP2LUN : kIOMessageServiceIsResumed\n" ) );
+				FWKLOG( ( "IOFireWireSBP2LUN<%p> : kIOMessageServiceIsResumed\n", this ) );
                 resumeNotify();
                 res = kIOReturnSuccess;
                 break;
@@ -333,8 +349,12 @@ IOReturn IOFireWireSBP2LUN::message( UInt32 type, IOService *nub, void *arg )
    }
 
     // we must send resumeNotify and/or suspendNotify before messaging clients
-  	if( type != kIOMessageServiceIsTerminated )
-		messageClients( type, arg );
+	if( type != kIOMessageServiceIsTerminated &&
+		type != (UInt32)kIOMessageFWSBP2ReconnectFailed &&
+		type != (UInt32)kIOMessageFWSBP2ReconnectComplete )
+	{
+		messageClients( type, arg );    
+    }
 	
 	// send reset notification for all busy orbs
 	// we must send orb reset notification after messaging clients
@@ -352,7 +372,15 @@ IOReturn IOFireWireSBP2LUN::message( UInt32 type, IOService *nub, void *arg )
 
 IOFireWireUnit * IOFireWireSBP2LUN::getFireWireUnit( void )
 {
-    return fProviderTarget->getFireWireUnit();
+	IOService * unit = NULL;
+	
+	IOService * provider = getProvider();
+	if( provider )
+	{
+		unit = provider->getProvider();
+	}
+	
+    return (IOFireWireUnit*)unit;
 }
 
 // getLUNumber
@@ -370,7 +398,7 @@ UInt32 IOFireWireSBP2LUN::getLUNumber( void )
 
 IOFireWireSBP2Target * IOFireWireSBP2LUN::getTarget( void )
 {
-    return fProviderTarget;
+	return (IOFireWireSBP2Target*)getProvider();
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -433,8 +461,7 @@ IOReturn IOFireWireSBP2LUN::staticRemoveLoginAction( OSObject *self, void * logi
 
 IOReturn IOFireWireSBP2LUN::removeLoginAction( IOFireWireSBP2Login * login )
 {
-	fLoginSet->removeObject( login );
-	
+	fLoginSet->removeObject( login );	
 	return kIOReturnSuccess;
 }
 
@@ -444,6 +471,18 @@ IOReturn IOFireWireSBP2LUN::removeLoginAction( IOFireWireSBP2Login * login )
 
 void IOFireWireSBP2LUN::clearAllTasksInSet( void )
 {
+	if( fORBSetIterator )
+	{
+		IOFireWireSBP2ManagementORB * item = NULL;		
+		fORBSetIterator->reset();
+		do
+		{
+			item = (IOFireWireSBP2ManagementORB *)fORBSetIterator->getNextObject();
+			if( item )
+				item->suspendedNotify();
+		} while( item );
+	}
+
  	if( fLoginSetIterator )
 	{
 		IOFireWireSBP2Login * item = NULL;
@@ -551,37 +590,11 @@ bool IOFireWireSBP2LUN::matchPropertyTable(OSDictionary * table)
 				compareProperty(table, gCommand_Set_Revision_Symbol) &&
 				compareProperty(table, gIOUnit_Symbol) &&
 				compareProperty(table, gFirmware_Revision_Symbol) &&
-				compareProperty(table, gDevice_Type_Symbol);
+				compareProperty(table, gDevice_Type_Symbol) &&
+                compareProperty(table, gGUID_Symbol) &&
+                compareProperty(table, gFireWireModel_ID);
 				
     return res;
-}
-
-// newUserClient
-//
-//
-
-IOReturn IOFireWireSBP2LUN::newUserClient(task_t  owningTask, void * /* security_id */,
-                                          UInt32 type,  IOUserClient **	handler )
-{
-    IOReturn			err = kIOReturnSuccess;
-    IOFireWireSBP2UserClient *	client;
-
-    if( type != kIOFireWireSBP2LibConnection )
-        return( kIOReturnBadArgument);
-
-    client = IOFireWireSBP2UserClient::withTask(owningTask);
-
-    if( !client || (false == client->attach( this )) ||
-        (false == client->start( this )) ) {
-        if(client) {
-            client->detach( this );
-            client->release();
-        }
-        err = kIOReturnNoMemory;
-    }
-
-    *handler = client;
-    return( err );
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -635,6 +648,22 @@ void IOFireWireSBP2LUN::resumeNotify( void )
 		} while( item );
 	}
 }
+
+void IOFireWireSBP2LUN::terminateNotify( void )
+{ 
+    if( fLoginSetIterator )
+	{
+		IOFireWireSBP2Login * item = NULL;
+		fLoginSetIterator->reset();        
+		do
+		{
+			item = (IOFireWireSBP2Login *)fLoginSetIterator->getNextObject();
+			if( item )
+				item->terminateNotify();
+		} while( item );
+	}
+}
+
 
 // getDiagnostics
 //

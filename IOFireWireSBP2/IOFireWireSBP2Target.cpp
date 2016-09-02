@@ -21,7 +21,11 @@
  */
 
 #include <IOKit/IOMessage.h>
-#include <IOKit/firewire/IOFireWireLink.h>
+
+#define FIREWIREPRIVATE
+#include <IOKit/firewire/IOFireWireController.h>
+#undef FIREWIREPRIVATE
+
 #include <IOKit/firewire/IOConfigDirectory.h>
 #include <IOKit/firewire/IOFireWireDevice.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -37,7 +41,11 @@ const OSSymbol *gCommand_Set_Revision_Symbol = NULL;
 const OSSymbol *gIOUnit_Symbol = NULL;
 const OSSymbol *gFirmware_Revision_Symbol = NULL;
 const OSSymbol *gDevice_Type_Symbol = NULL;
-
+const OSSymbol *gGUID_Symbol = NULL;
+const OSSymbol *gUnit_Characteristics_Symbol = NULL;
+const OSSymbol *gManagement_Agent_Offset_Symbol = NULL;
+const OSSymbol *gFast_Start_Symbol = NULL;
+		
 OSDefineMetaClassAndStructors(IOFireWireSBP2Target, IOService);
 
 OSMetaClassDefineReservedUnused(IOFireWireSBP2Target, 0);
@@ -59,9 +67,30 @@ bool IOFireWireSBP2Target::start( IOService *provider )
     fProviderUnit = OSDynamicCast(IOFireWireUnit, provider);
     if (fProviderUnit == NULL)
         return false;
+	
+	fProviderUnit->retain();
+	
+	// we want the expansion data member to be zeroed if it's available 
+	// so create and zero in a local then assign to the member when were done
+	
+	ExpansionData * exp_data = (ExpansionData*) IOMalloc( sizeof(ExpansionData) );
+	if( !exp_data )
+	{
+		return false;
+	}
 
+	bzero( exp_data, sizeof(ExpansionData) );
+	
+	fExpansionData = exp_data;
+	
+	fControl = fProviderUnit->getController();
+	
+	// assume safe mode
+	fFlags = kIOFWSBP2FailsOnBusResetsDuringIO;
+	
     fOpenFromTarget = false;
     fOpenFromLUNCount = 0;
+	fIOCriticalSectionCount = 0;
 	
 	//
 	// create symbols
@@ -88,22 +117,129 @@ bool IOFireWireSBP2Target::start( IOService *provider )
 	if( gDevice_Type_Symbol == NULL )
 		gDevice_Type_Symbol = OSSymbol::withCString("Device_Type");
 
+	if( gGUID_Symbol == NULL )
+		gGUID_Symbol = OSSymbol::withCString("GUID");
+
+	if( gUnit_Characteristics_Symbol == NULL )
+		gUnit_Characteristics_Symbol = OSSymbol::withCString("Unit_Characteristics");
+	
+	if( gManagement_Agent_Offset_Symbol == NULL )
+		gManagement_Agent_Offset_Symbol = OSSymbol::withCString("Management_Agent_Offset");
+
+	if( gFast_Start_Symbol == NULL )
+		gFast_Start_Symbol = OSSymbol::withCString("Fast_Start");
+			
     if (IOService::start(provider))
     {
+		IOFireWireController * 	controller = fProviderUnit->getController();
+        IOService * 			fwim = (IOService*)controller->getLink();
+		OSObject *				prop = NULL;
+		UInt32					byteCount1, byteCount2;
+		
+		//
+		// read receive properties from registry		
+		//
+		
+		byteCount1 = 0;
+		prop = fwim->getProperty( "FWMaxAsyncReceiveBytes" );
+		if( prop )
+		{
+			byteCount1 = ((OSNumber*)prop)->unsigned32BitValue();
+			if( byteCount1 != 0 )
+			{
+				// minus 32 bytes for status block
+				byteCount1 -= 32; 
+			}
+		}
+		
+		byteCount2 = 0;
+		prop = fwim->getProperty( "FWMaxAsyncReceivePackets" );
+		if( prop )
+		{
+			UInt32 packetCount = ((OSNumber*)prop)->unsigned32BitValue();
+			if( packetCount != 0 )
+			{
+				// minus 1 for the status block
+				byteCount2 = (packetCount - 1) * 512; // 512 bytes is minimum packet size
+			}
+		}
+			
+		// publish min byte size
+		UInt32 size = byteCount1 < byteCount2 ? byteCount1 : byteCount2;
+		if( size != 0)
+			setProperty( "SBP2ReceiveBufferByteCount", size, 32 );
+		
+		// start scanning for LUNs
         scanForLUNs();
     }
     else
         return false;
 
-    FWKLOG( ( "IOFireWireSBP2Target : started\n" ) );
+    FWKLOG( ( "IOFireWireSBP2Target<%p> : started\n", this ) );
+	
+	fExpansionData->fStarted = true;
+	
     return true;
 }
 
+// stop
+//
+//
+
 void IOFireWireSBP2Target::stop( IOService *provider )
 {
-    FWKLOG( ( "IOFireWireSBP2Target : stopped\n" ) );
+    FWKLOG( ( "IOFireWireSBP2Target<%p>::stop\n", this ) );
 
     IOService::stop(provider);
+}
+
+// finalize
+//
+//
+
+bool IOFireWireSBP2Target::finalize( IOOptionBits options )
+{
+    // Nuke from device tree
+    detachAll( gIODTPlane );
+	
+	return IOService::finalize( options );
+}
+
+// free
+//
+//
+
+void IOFireWireSBP2Target::free( void )
+{
+	FWKLOG( ( "IOFireWireSBP2Target<%p>::free\n", this ) );
+
+	if( fIOCriticalSectionCount != 0 )
+	{
+		IOLog( "IOFireWireSBP2Target<%p>::free - fIOCriticalSectionCount == %d!\n", this, fIOCriticalSectionCount );
+	}
+	
+	while( fIOCriticalSectionCount != 0 )
+	{
+		fIOCriticalSectionCount--;
+		fControl->endIOCriticalSection();
+	}
+
+	if( fExpansionData )
+	{
+		if( fExpansionData->fPendingMgtAgentCommands )
+			fExpansionData->fPendingMgtAgentCommands->release() ;
+	
+		IOFree( fExpansionData, sizeof(ExpansionData) );
+		fExpansionData = NULL;
+	}
+	
+	if( fProviderUnit )
+	{
+		fProviderUnit->release();
+		fProviderUnit = NULL;
+	}
+	
+	IOService::free();
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -116,7 +252,7 @@ IOReturn IOFireWireSBP2Target::message( UInt32 type, IOService *nub, void *arg )
 {
     IOReturn res = kIOReturnUnsupported;
 
-    FWKLOG( ("IOFireWireSBP2Target : message 0x%x, arg 0x%08lx\n", type, arg) );
+    FWKLOG( ("IOFireWireSBP2Target<%p> : message 0x%x, arg 0x%08lx\n", this, type, arg) );
 
     res = IOService::message(type, nub, arg);
     if( kIOReturnUnsupported == res )
@@ -124,17 +260,18 @@ IOReturn IOFireWireSBP2Target::message( UInt32 type, IOService *nub, void *arg )
         switch (type)
         {                
             case kIOMessageServiceIsTerminated:
-                FWKLOG( ( "IOFireWireSBP2Target : kIOMessageServiceIsTerminated\n" ) );
+                FWKLOG( ( "IOFireWireSBP2Target<%p> : kIOMessageServiceIsTerminated\n", this ) );
                 res = kIOReturnSuccess;
                 break;
 
             case kIOMessageServiceIsSuspended:
-                FWKLOG( ( "IOFireWireSBP2Target : kIOMessageServiceIsSuspended\n" ) );
+                FWKLOG( ( "IOFireWireSBP2Target<%p> : kIOMessageServiceIsSuspended\n", this ) );
+                clearMgmtAgentAccess();
                 res = kIOReturnSuccess;
                 break;
 
             case kIOMessageServiceIsResumed:
-                FWKLOG( ( "IOFireWireSBP2Target : kIOMessageServiceIsResumed\n" ) );
+                FWKLOG( ( "IOFireWireSBP2Target<%p> : kIOMessageServiceIsResumed\n", this ) );
                 configurePhysicalFilter();
                 res = kIOReturnSuccess;
                 break;
@@ -144,8 +281,12 @@ IOReturn IOFireWireSBP2Target::message( UInt32 type, IOService *nub, void *arg )
         }
     }
 
-	if( type != kIOMessageServiceIsTerminated )
+	if( type != kIOMessageServiceIsTerminated &&
+		type != (UInt32)kIOMessageFWSBP2ReconnectFailed &&
+		type != (UInt32)kIOMessageFWSBP2ReconnectComplete )
+	{
 		messageClients( type, arg );    
+    } 
     
     return res;
 }
@@ -156,7 +297,7 @@ IOReturn IOFireWireSBP2Target::message( UInt32 type, IOService *nub, void *arg )
 
 IOFireWireUnit * IOFireWireSBP2Target::getFireWireUnit( void )
 {
-    return fProviderUnit;
+	return (IOFireWireUnit*)getProvider();
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -173,7 +314,7 @@ bool IOFireWireSBP2Target::handleOpen( IOService * forClient, IOOptionBits optio
 {
     bool ok = true;
 
-    FWKLOG(( "enter handleOpen fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", fOpenFromLUNCount, fOpenFromTarget ));
+    FWKLOG(( "IOFireWireSBP2Target<%p::handleOpen entered fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", this, fOpenFromLUNCount, fOpenFromTarget ));
     
     IOFireWireSBP2LUN * lunClient = OSDynamicCast( IOFireWireSBP2LUN, forClient );
     if( lunClient != NULL )
@@ -190,7 +331,7 @@ bool IOFireWireSBP2Target::handleOpen( IOService * forClient, IOOptionBits optio
             {
                 fOpenFromLUNCount++;
                 ok = IOService::handleOpen( this, options, arg );
-                FWKLOG(( "called open\n" ));
+                FWKLOG(( "IOFireWireSBP2Target<%p>::handleOpen called open\n", this ));
             }
         }
         else
@@ -213,21 +354,21 @@ bool IOFireWireSBP2Target::handleOpen( IOService * forClient, IOOptionBits optio
             {
                 fOpenFromTarget = true;
                 ok = IOService::handleOpen( forClient, options, arg );
-                FWKLOG(( "called open\n" ));
+                FWKLOG(( "IOFireWireSBP2Target<%p>::handleOpen called open\n", this ));
             }
         }
         else
             ok = false;   // already open
     }
 
-    FWKLOG(( "exit handleOpen fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", fOpenFromLUNCount, fOpenFromTarget ));
+    FWKLOG(( "IOFireWireSBP2Target<%p>::handleOpen - exit handleOpen fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", this, fOpenFromLUNCount, fOpenFromTarget ));
     
     return ok;
 }
 
 void IOFireWireSBP2Target::handleClose( IOService * forClient, IOOptionBits options )
 {
-    FWKLOG(( "enter handleClose fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", fOpenFromLUNCount, fOpenFromTarget ));
+    FWKLOG(( "IOFireWireSBP2Target<%p>::handleClose enter handleClose fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", this, fOpenFromLUNCount, fOpenFromTarget ));
     
     IOFireWireSBP2LUN * lunClient = OSDynamicCast( IOFireWireSBP2LUN, forClient );
     if( lunClient != NULL )
@@ -240,7 +381,7 @@ void IOFireWireSBP2Target::handleClose( IOService * forClient, IOOptionBits opti
             {
                 IOService::handleClose( this, options);
                 fProviderUnit->close(this, options);
-                FWKLOG(( "called close\n" ));
+                FWKLOG(( "IOFireWireSBP2Target<%p>::handleClose - called close\n", this ));
             }
         }
     }
@@ -251,11 +392,11 @@ void IOFireWireSBP2Target::handleClose( IOService * forClient, IOOptionBits opti
             fOpenFromTarget = false;
             IOService::handleClose(forClient, options);
             fProviderUnit->close(this, options);
-            FWKLOG(( "called close\n" ));
+            FWKLOG(( "IOFireWireSBP2Target<%p::handleClose - called close\n", this ));
         }
     }
 
-    FWKLOG(( "exit handleClose fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", fOpenFromLUNCount, fOpenFromTarget ));
+    FWKLOG(( "IOFireWireSBP2Target<%p>::handleClose - exit handleClose fOpenFromLUNCount = %d, fOpenFromTarget = %d\n", this, fOpenFromLUNCount, fOpenFromTarget ));
 }
 
 //
@@ -298,21 +439,28 @@ void IOFireWireSBP2Target::scanForLUNs( void )
     IOReturn		status = kIOReturnSuccess;
     IOReturn		tempStatus = kIOReturnSuccess;
     
-	UInt32			cmdSpecID 			= 0;
-	UInt32			cmdSet 				= 0;
-	UInt32			vendorID			= 0;	
-	UInt32			softwareRev 		= 0;
-	UInt32			firmwareRev 		= 0;
-	UInt32			lun					= 0;
-	UInt32			devType				= 0;
+	LUNInfo info;
+
+	info.cmdSpecID 				= 0;
+	info.cmdSet 				= 0;
+	info.vendorID				= 0;
+	info.softwareRev 			= 0;
+	info.firmwareRev 			= 0;
+	info.lun					= 0;
+	info.devType				= 0;
+	info.unitCharacteristics 	= 0;
+	info.managementOffset 		= 0;
+	info.revision				= 0;
+	info.fastStartSupported 	= false;
+	info.fastStart				= 0;
 	
-    //
+	//
     // get root directory
     //
 
     IOConfigDirectory *		directory;
     
-    IOFireWireDevice *  device;
+    IOFireWireDevice *  device = NULL;
     IOService *		providerService = fProviderUnit->getProvider();
     if( providerService == NULL )
         status = kIOReturnError;
@@ -322,13 +470,13 @@ void IOFireWireSBP2Target::scanForLUNs( void )
         device = OSDynamicCast( IOFireWireDevice, providerService );
         if( device == NULL )
             status = kIOReturnError;
-        FWKLOG( ("IOFireWireSBP2Target : unit = 0x%08lx, provider = 0x%08lx, device = 0x%08lx\n", fProviderUnit, providerService, device) );
+        FWKLOG( ("IOFireWireSBP2Target<%p> : unit = 0x%08lx, provider = 0x%08lx, device = 0x%08lx\n", this, fProviderUnit, providerService, device) );
     }
     
     if( status == kIOReturnSuccess )
     {
         status = device->getConfigDirectory( directory );
-        FWKLOG( ( "IOFireWireSBP2Target : status = %d\n", status ) );
+        FWKLOG( ( "IOFireWireSBP2Target<%p> : status = %d\n", this, status ) );
     }
     
     //
@@ -336,56 +484,43 @@ void IOFireWireSBP2Target::scanForLUNs( void )
     //
 
     if( status == kIOReturnSuccess )
-        tempStatus = directory->getKeyValue( kConfigModuleVendorIdKey, vendorID );
+        tempStatus = directory->getKeyValue( kConfigModuleVendorIdKey, info.vendorID );
 
 	//
 	// get unit directory
     //
     
     status = fProviderUnit->getConfigDirectory( directory );
-    FWKLOG( ( "IOFireWireSBP2Target : status = %d\n", status ) );
+    FWKLOG( ( "IOFireWireSBP2Target<%p> : status = %d\n", this, status ) );
   	
 	//
 	// find command spec id
 	//
 
     if( status == kIOReturnSuccess )
-        status = directory->getKeyValue( kCmdSpecIDKey, cmdSpecID );
+        status = directory->getKeyValue( kCmdSpecIDKey, info.cmdSpecID );
     
 	//
 	// find command set
 	//
 
     if( status == kIOReturnSuccess )
-        status = directory->getKeyValue( kCmdSetKey, cmdSet );
+        status = directory->getKeyValue( kCmdSetKey, info.cmdSet );
 
-    // failure to find one of the following is not fatal, hence the use of tempStatus
-    
 	//
-	// find software rev
+	// find unit characteristics
 	//
-    
-    if( status == kIOReturnSuccess )
-         tempStatus = directory->getKeyValue( kSoftwareRevKey, softwareRev );
+	
+	if( status == kIOReturnSuccess )
+        status = directory->getKeyValue( kUnitCharacteristicsKey, info.unitCharacteristics );
 
-    //
-	// find firmware rev
 	//
-
-    if( status == kIOReturnSuccess )
-        tempStatus = directory->getKeyValue( kFirmwareRevKey, firmwareRev );
-
-     FWKLOG( ( "IOFireWireSBP2Target : status = %d, cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d, firmwareRev = %d\n",
-                             status, cmdSpecID, cmdSet, vendorID, softwareRev, firmwareRev ) );
-
-    //
 	// find management agent offset
     // and add ourselves to the DeviceTree with that location
     // for OpenFirmware boot path generation.
 	//
     
-	UInt32 offset;
-    status = directory->getKeyValue( kManagementAgentOffsetKey, offset );
+    status = directory->getKeyValue( kManagementAgentOffsetKey, info.managementOffset );
     if( status == kIOReturnSuccess )
     {
         IOService *parent = this;
@@ -396,13 +531,52 @@ void IOFireWireSBP2Target::scanForLUNs( void )
         }
         if(parent) {
             char location[9];
-            sprintf(location, "%lx", offset);
+            snprintf( location, sizeof(location), "%lx", info.managementOffset );
             attachToParent(parent, gIODTPlane);
             setLocation(location, gIODTPlane);
             setName("sbp-2", gIODTPlane);
         }
     }
  
+    // failure to find one of the following is not fatal, hence the use of tempStatus
+	
+	//
+	// find revision
+	//
+	
+	if( status == kIOReturnSuccess )
+        tempStatus = directory->getKeyValue( kRevisionKey, info.revision );
+
+	//
+	// find fast start info
+	//
+	
+	if( status == kIOReturnSuccess && info.revision != 0 )
+	{
+		tempStatus = directory->getKeyValue( kFastStartKey, info.fastStart );
+		if( tempStatus == kIOReturnSuccess )
+		{
+			info.fastStartSupported = true;
+		}
+	}
+
+	//
+	// find software rev
+	//
+    
+    if( status == kIOReturnSuccess )
+         tempStatus = directory->getKeyValue( kSoftwareRevKey, info.softwareRev );
+
+    //
+	// find firmware rev
+	//
+
+    if( status == kIOReturnSuccess )
+        tempStatus = directory->getKeyValue( kFirmwareRevKey, info.firmwareRev );
+
+     FWKLOG( ( "IOFireWireSBP2Target<%p> : status = %d, cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d, firmwareRev = %d\n",
+                             this, status, info.cmdSpecID, info.cmdSet, info.vendorID, info.softwareRev, info.firmwareRev ) );
+
     //
     // look for luns implemented as immediate values
     //
@@ -415,8 +589,8 @@ void IOFireWireSBP2Target::scanForLUNs( void )
             // get index key
             UInt32 key;
             tempStatus = directory->getIndexEntry( pos, key );
-            FWKLOG( ( "IOFireWireSBP2Target : tempStatus = %d, pos = %d, key = %d\n",
-                             tempStatus, pos, key ) );
+            FWKLOG( ( "IOFireWireSBP2Target<%p> : tempStatus = %d, pos = %d, key = %d\n",
+                             this, tempStatus, pos, key ) );
             
             // if it was the LUN key
             if( tempStatus == kIOReturnSuccess && key >> kConfigEntryKeyValuePhase == kLUNKey )
@@ -425,18 +599,23 @@ void IOFireWireSBP2Target::scanForLUNs( void )
                 tempStatus = directory->getIndexValue( pos, data );
                 if( tempStatus == kIOReturnSuccess )
                 {
-                    lun = data  & 0x0000ffff;
-                    devType = (data & 0x001f0000) >> 16;
+                    info.lun = data  & 0x0000ffff;
+                    info.devType = (data & 0x001f0000) >> 16;
 
-                    FWKLOG( ( "IOFireWireSBP2Target : cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d\n",
-                             cmdSpecID, cmdSet, vendorID, softwareRev ) );
-                    FWKLOG( ( "IOFireWireSBP2Target : firmwareRev = %d, lun = %d, devType = %d\n",
-                             firmwareRev, lun, devType ) );
-
+                    FWKLOG( ( "IOFireWireSBP2Target<%p> : cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d\n",
+                             this, info.cmdSpecID, info.cmdSet, info.vendorID, info.softwareRev ) );
+                    FWKLOG( ( "IOFireWireSBP2Target<%p> : firmwareRev = %d, lun = %d, devType = %d\n",
+                             this, info.firmwareRev, info.lun, info.devType ) );
+					FWKLOG( ( "IOFireWireSBP2Target<%p> : unitCharacteristics = %d, managementOffset = %d,\n",
+                             this, info.unitCharacteristics, info.managementOffset ) );
+					FWKLOG( ( "IOFireWireSBP2Target<%p> : revision = %d, fastStartSupported = %d, fastStart = 0x%08lx\n",
+                         this, info.revision, info.fastStartSupported, info.fastStart ) );
+						 
                     // force vendors to use real values, (0, 0) is not legal
-                    if( (cmdSpecID & 0x00ffffff) || (cmdSet & 0x00ffffff) )
+                    if( (info.cmdSpecID & 0x00ffffff) || (info.cmdSet & 0x00ffffff) )
                     {
-                        createLUN( cmdSpecID, cmdSet, vendorID, softwareRev, firmwareRev, lun, devType );
+                    	fExpansionData->fNumLUNs++;
+                        createLUN( &info );
                     }
                 }
             }
@@ -458,29 +637,47 @@ void IOFireWireSBP2Target::scanForLUNs( void )
         // iterate through directories
         while( (lunDirectory = OSDynamicCast(IOConfigDirectory,directoryIterator->getNextObject())) != NULL )
         {
+			//
+			// find fast start info
+			//
+			
+			if( info.revision != 0 )
+			{
+				tempStatus = directory->getKeyValue( kFastStartKey, info.fastStart );
+				if( tempStatus == kIOReturnSuccess )
+				{
+					info.fastStartSupported = true;
+				}
+			}
+			
             // get lun value
             
             tempStatus = lunDirectory->getKeyValue( kLUNKey, lunValue );
             if( tempStatus == kIOReturnSuccess )
             {
-                lun = lunValue  & 0x0000ffff;
-                devType = (lunValue & 0x001f0000) >> 16;
+                info.lun = lunValue  & 0x0000ffff;
+                info.devType = (lunValue & 0x001f0000) >> 16;
 
-                FWKLOG( ( "IOFireWireSBP2Target : cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d\n",
-                         cmdSpecID, cmdSet, vendorID, softwareRev ) );
-                FWKLOG( ( "IOFireWireSBP2Target : firmwareRev = %d, lun = %d, devType = %d\n",
-                         firmwareRev, lun, devType ) );
-
+                FWKLOG( ( "IOFireWireSBP2Target<%p> : cmdSpecID = %d, cmdSet = %d, vendorID = %d, softwareRev = %d\n",
+                         this, info.cmdSpecID, info.cmdSet, info.vendorID, info.softwareRev ) );
+                FWKLOG( ( "IOFireWireSBP2Target<%p> : firmwareRev = %d, lun = %d, devType = %d\n",
+                         this, info.firmwareRev, info.lun, info.devType ) );
+				FWKLOG( ( "IOFireWireSBP2Target<%p> : revision = %d, fastStartSupported = %d, fastStart = 0x%08lx\n",
+                         this, info.revision, info.fastStartSupported, info.fastStart ) );
+						 
                 // force vendors to use real values, (0, 0) is not legal
-                if( (cmdSpecID & 0x00ffffff) || (cmdSet & 0x00ffffff) )
+                if( (info.cmdSpecID & 0x00ffffff) || (info.cmdSet & 0x00ffffff) )
                 {
-                    createLUN( cmdSpecID, cmdSet, vendorID, softwareRev, firmwareRev, lun, devType );
+                	fExpansionData->fNumLUNs++;
+					createLUN( &info );
                 }
             }
         }
         
         directoryIterator->release();
     }
+
+	fExpansionData->fPendingMgtAgentCommands = OSArray::withCapacity( fExpansionData->fNumLUNs) ;
 
     //
     // we found all the luns so lets call registerService on ourselves
@@ -493,36 +690,51 @@ void IOFireWireSBP2Target::scanForLUNs( void )
     {
         // all of these values are 24 bits or less, even though we have specified 32 bits
 
-		prop = OSNumber::withNumber( cmdSpecID, 32 );
+		prop = OSNumber::withNumber( info.cmdSpecID, 32 );
         setProperty( gCommand_Set_Spec_ID_Symbol, prop );
         prop->release();
 
-		prop = OSNumber::withNumber( cmdSet, 32 );
+		prop = OSNumber::withNumber( info.cmdSet, 32 );
         setProperty( gCommand_Set_Symbol, prop );
         prop->release();
  
-        prop = OSNumber::withNumber( vendorID, 32 );
+        prop = OSNumber::withNumber( info.vendorID, 32 );
         setProperty( gModule_Vendor_ID_Symbol, prop );
         prop->release();
  
-        prop = OSNumber::withNumber( softwareRev, 32 );
+        prop = OSNumber::withNumber( info.softwareRev, 32 );
         setProperty( gCommand_Set_Revision_Symbol, prop );
         prop->release();
  
-        prop = OSNumber::withNumber( firmwareRev, 32 );
+        prop = OSNumber::withNumber( info.firmwareRev, 32 );
         setProperty( gFirmware_Revision_Symbol, prop );
         prop->release();
  
-        prop = OSNumber::withNumber( devType, 32 );
+        prop = OSNumber::withNumber( info.devType, 32 );
         setProperty( gDevice_Type_Symbol, prop );
         prop->release();
 
+        prop = fProviderUnit->getProperty(gGUID_Symbol);
+        if( prop )
+            setProperty( gGUID_Symbol, prop );
+ 
+		prop = fProviderUnit->getProperty(gFireWireModel_ID);
+        if( prop )
+			setProperty( gFireWireModel_ID, prop );
+
+		prop = fProviderUnit->getProperty(gFireWireProduct_Name);
+        if( prop )
+            setProperty( gFireWireProduct_Name, prop );
+
+		prop = fProviderUnit->getProperty(gFireWireVendor_Name);
+        if( prop )
+            setProperty( gFireWireVendor_Name, prop );
+			       
         registerService();
     }
 }
 
-IOReturn IOFireWireSBP2Target::createLUN( UInt32 cmdSpecID, UInt32 cmdSet, UInt32 vendorID, UInt32 softwareRev,
-                                          UInt32 firmwareRev, UInt32 lun, UInt32 devType )
+IOReturn IOFireWireSBP2Target::createLUN( LUNInfo * info )
 
 {
     IOReturn	status = kIOReturnSuccess;
@@ -533,63 +745,67 @@ IOReturn IOFireWireSBP2Target::createLUN( UInt32 cmdSpecID, UInt32 cmdSet, UInt3
 
     if( propTable )
     {
-
-#if 0
-		const OSSymbol * propSymbol;
-
-		////////////////////////////////////////////
-        // make user client sub dictionary
-        OSDictionary * userClient = OSDictionary::withCapacity(2);
-
-        propSymbol = OSSymbol::withCString("A45B8156-B51B-11D4-AB4B-000A277E7234");
-        prop = OSString::withCString("IOFireWireSBP2Lib.plugin");
-        userClient->setObject( propSymbol, prop );
-        prop->release();
-        propSymbol->release();
-
-        propSymbol = OSSymbol::withCString("631F68D2-B9E6-11D4-8147-000A277E7234");
-        prop = OSString::withCString("SBP2SampleDriver.plugin");
-        userClient->setObject( propSymbol, prop );
-        prop->release();
-        propSymbol->release();
-
-
-        ////////////////////////////////////////////
-                
-        propSymbol = OSSymbol::withCString("IOCFPlugInTypes");
-        propTable->setObject( propSymbol, userClient );
-        propSymbol->release();
-#endif        
         // all of these values are 24 bits or less, even though we have specified 32 bits
 
-        prop = OSNumber::withNumber( cmdSpecID, 32 );
+        prop = OSNumber::withNumber( info->cmdSpecID, 32 );
         propTable->setObject( gCommand_Set_Spec_ID_Symbol, prop );
         prop->release();
 
-		prop = OSNumber::withNumber( cmdSet, 32 );
+		prop = OSNumber::withNumber( info->cmdSet, 32 );
         propTable->setObject( gCommand_Set_Symbol, prop );
         prop->release();
 
-		prop = OSNumber::withNumber( vendorID, 32 );
+		prop = OSNumber::withNumber( info->vendorID, 32 );
         propTable->setObject( gModule_Vendor_ID_Symbol, prop );
         prop->release();
   
-        prop = OSNumber::withNumber( softwareRev, 32 );
+        prop = OSNumber::withNumber( info->softwareRev, 32 );
         propTable->setObject( gCommand_Set_Revision_Symbol, prop );
         prop->release();
  
-        prop = OSNumber::withNumber( firmwareRev, 32 );
+        prop = OSNumber::withNumber( info->firmwareRev, 32 );
         propTable->setObject( gFirmware_Revision_Symbol, prop );
         prop->release();
 
-        prop = OSNumber::withNumber( lun, 32 );
+        prop = OSNumber::withNumber( info->lun, 32 );
         propTable->setObject( gIOUnit_Symbol, prop );
         prop->release();
 
-        prop = OSNumber::withNumber( devType, 32 );
+        prop = OSNumber::withNumber( info->devType, 32 );
         propTable->setObject( gDevice_Type_Symbol, prop );
         prop->release();
  
+		prop = OSNumber::withNumber( info->unitCharacteristics, 32 );
+        propTable->setObject( gUnit_Characteristics_Symbol, prop );
+        prop->release();
+		
+		prop = OSNumber::withNumber(info->managementOffset, 32 );
+        propTable->setObject( gManagement_Agent_Offset_Symbol, prop );
+        prop->release();
+		
+		if( info->fastStartSupported )
+		{
+			prop = OSNumber::withNumber( info->fastStart, 32 );
+			propTable->setObject( gFast_Start_Symbol, prop );
+			prop->release();
+		}
+		
+        prop = fProviderUnit->getProperty(gGUID_Symbol);
+        if( prop )
+            propTable->setObject( gGUID_Symbol, prop );
+ 
+		prop = fProviderUnit->getProperty(gFireWireModel_ID);
+        if( prop )
+            propTable->setObject( gFireWireModel_ID, prop );
+
+		prop = fProviderUnit->getProperty(gFireWireProduct_Name);
+        if( prop )
+            propTable->setObject( gFireWireProduct_Name, prop );
+
+		prop = fProviderUnit->getProperty(gFireWireVendor_Name);
+        if( prop )
+            propTable->setObject( gFireWireVendor_Name, prop );
+        
 		//
         // create lun
         //
@@ -608,7 +824,7 @@ IOReturn IOFireWireSBP2Target::createLUN( UInt32 cmdSpecID, UInt32 cmdSet, UInt3
             if( success )
                 newLUN->registerService();
 
-            FWKLOG( ( "IOFireWireSBP2Target : created LUN object - success = %d\n", success ) );
+            FWKLOG( ( "IOFireWireSBP2Target<%p> : created LUN object - success = %d\n", this, success ) );
 
             if( !success )
                 status = kIOReturnError;
@@ -647,16 +863,27 @@ bool IOFireWireSBP2Target::matchPropertyTable(OSDictionary * table)
 				compareProperty(table, gModule_Vendor_ID_Symbol) &&
 				compareProperty(table, gCommand_Set_Revision_Symbol) &&
 				compareProperty(table, gFirmware_Revision_Symbol) &&
-				compareProperty(table, gDevice_Type_Symbol);
+				compareProperty(table, gDevice_Type_Symbol) &&
+                compareProperty(table, gGUID_Symbol) &&
+                compareProperty(table, gFireWireModel_ID);
 				
     return res;
 }
 
 void IOFireWireSBP2Target::setTargetFlags( UInt32 flags )
 {
-    fFlags = flags;
+	fFlags |= flags;
     
-    // IOLog( "IOFireWireSBP2Target::setTargetFlags 0x%08lx\n", fFlags );
+	FWKLOG(( "IOFireWireSBP2Target<%p>::setTargetFlags 0x%08lx\n", this, fFlags ));
+    
+    configurePhysicalFilter();
+}
+
+void IOFireWireSBP2Target::clearTargetFlags( UInt32 flags )
+{
+	fFlags &= ~flags;
+    
+	FWKLOG(( "IOFireWireSBP2Target<%p>::clearTargetFlags 0x%08lx\n", this, fFlags ));
     
     configurePhysicalFilter();
 }
@@ -670,6 +897,15 @@ void IOFireWireSBP2Target::configurePhysicalFilter( void )
 {
     bool disablePhysicalAccess = false;
     
+	// sometimes message() gets called before start completes
+	// we shouldn't try to configure anything until start is done
+	
+	if( fExpansionData == NULL )
+		return;
+		
+	if( !fExpansionData->fStarted )
+		return;
+		
     //
     // determine if we should turn off physical access
     //
@@ -677,7 +913,7 @@ void IOFireWireSBP2Target::configurePhysicalFilter( void )
     if( fFlags & kIOFWSBP2FailsOnAckBusy )
     {
         IOFireWireController * controller = fProviderUnit->getController();
-        IOFireWireLink * fwim = controller->getLink();
+        IOService * fwim = (IOService*)controller->getLink();
  
         UInt32 deviceCount = 0;
 		
@@ -715,15 +951,171 @@ void IOFireWireSBP2Target::configurePhysicalFilter( void )
     
     if( disablePhysicalAccess )
     {
-		FWKLOG(( "IOFireWireSBP2Target::configurePhysicalFilter disabling physical access for unit 0x%08lx\n", fProviderUnit ));
-        UInt32 flags = fProviderUnit->getNodeFlags();
-        fProviderUnit->setNodeFlags( flags | kIOFWDisableAllPhysicalAccess );
+		FWKLOG(( "IOFireWireSBP2Target<%p>::configurePhysicalFilter disabling physical access for unit 0x%08lx\n", this, fProviderUnit ));
+        fProviderUnit->setNodeFlags( kIOFWDisableAllPhysicalAccess );
     }
     else
     {
-		FWKLOG(( "IOFireWireSBP2Target::configurePhysicalFilter enabling physical access for unit 0x%08lx\n", fProviderUnit ));
-        UInt32 flags = fProviderUnit->getNodeFlags();
-        fProviderUnit->setNodeFlags( flags & (~kIOFWDisableAllPhysicalAccess) );
+		FWKLOG(( "IOFireWireSBP2Target<%p>::configurePhysicalFilter enabling physical access for unit 0x%08lx\n", this, fProviderUnit ));
+        fProviderUnit->clearNodeFlags( kIOFWDisableAllPhysicalAccess );
     }
     
+}
+
+// beginIOCriticalSection
+//
+//
+
+IOReturn IOFireWireSBP2Target::beginIOCriticalSection( void )
+{
+	IOReturn status = kIOReturnSuccess;
+
+	FWKLOG(( "IOFireWireSBP2Target<%p>::beginIOCriticalSection\n", this ));
+	
+	if( fFlags & kIOFWSBP2FailsOnBusResetsDuringIO )
+	{
+		FWKLOG(( "IOFireWireSBP2Target<%p>::beginIOCriticalSection fControl->disableSoftwareBusResets()\n", this ));
+		status = fControl->beginIOCriticalSection();
+		if( status == kIOReturnSuccess )
+		{
+			fIOCriticalSectionCount++;
+		}
+	}
+	
+	FWKLOG(( "IOFireWireSBP2Target<%p>::beginIOCriticalSection status = 0x%08lx\n", this, (UInt32)status ));
+	
+	return status;
+}
+
+// endIOCriticalSection
+//
+//
+
+void IOFireWireSBP2Target::endIOCriticalSection( void )
+{
+	FWKLOG(( "IOFireWireSBP2Target<%p>::endIOCriticalSection\n", this ));
+
+	if( fFlags & kIOFWSBP2FailsOnBusResetsDuringIO )
+	{
+		FWKLOG(( "IOFireWireSBP2Target<%p>::endIOCriticalSection fControl->enableSoftwareBusResets()\n", this ));
+		
+		if( fIOCriticalSectionCount != 0 )
+		{
+			fIOCriticalSectionCount--;
+			fControl->endIOCriticalSection();
+		}
+		else
+		{
+#if __LP64__
+			IOLog( "IOFireWireSBP2Target<0x%016llx>::endIOCriticalSection - fIOCriticalSectionCount == 0!\n", (UInt64)this );
+#else
+			IOLog( "IOFireWireSBP2Target<%p>::endIOCriticalSection - fIOCriticalSectionCount == 0!\n", this );
+#endif
+		}
+	}
+}
+
+// synchMgmtAgentAccess
+//
+//
+
+IOReturn IOFireWireSBP2Target::synchMgmtAgentAccess(
+	IOFWCommand	*				mgmtOrbCommand
+)
+{
+	if( fExpansionData->fNumLUNs > 1 )
+	{	
+		FWKLOG(("IOFireWireSBP2Target::synchMgmtAgentAccess count %x\n",fExpansionData->fNumberPendingMgtAgentOrbs + 1));
+	
+		if( fExpansionData->fNumberPendingMgtAgentOrbs++ )
+		{
+			FWKLOG(("IOFireWireSBP2Target::synchMgmtAgentAccess Mgmt Agent Busy, saving submit command %08x\n",mgmtOrbCommand));
+			fExpansionData->fPendingMgtAgentCommands->setObject( mgmtOrbCommand );
+		}
+		else
+			return( mgmtOrbCommand->submit() );
+	}
+	else
+		return( mgmtOrbCommand->submit() );
+
+	return kIOReturnSuccess;
+	
+}
+
+// completeMgmtAgentAccess
+//
+//
+
+void IOFireWireSBP2Target::completeMgmtAgentAccess( )
+{
+	IOFWAsyncCommand	*		mgmtOrbCommand;
+	IOReturn 					status = kIOReturnSuccess;
+
+	if( fExpansionData->fNumLUNs > 1 )
+	{
+
+		FWKLOG(("IOFireWireSBP2Target::completeMgmtAgentAccess >>  count %x\n",fExpansionData->fNumberPendingMgtAgentOrbs - 1));
+		if( fExpansionData->fNumberPendingMgtAgentOrbs-- )
+		{
+			mgmtOrbCommand = (IOFWAsyncCommand *)fExpansionData->fPendingMgtAgentCommands->getObject( 0 ) ;
+		
+			if( mgmtOrbCommand )
+			{
+				FWKLOG(("IOFireWireSBP2Target::completeMgmtAgentAccess, calling submit command %08x\n",mgmtOrbCommand));
+				fExpansionData->fPendingMgtAgentCommands->removeObject( 0 ) ;
+				
+				status = mgmtOrbCommand->submit() ;
+				
+				if( status )
+				{
+					FWKLOG(("IOFireWireSBP2Target::completeMgmtAgentAccess, submit for command %08x failed with %08x\n",mgmtOrbCommand,status));
+					mgmtOrbCommand->gotPacket( kFWResponseBusResetError, NULL, 0 );
+				}
+			}
+		}
+		FWKLOG(("IOFireWireSBP2Target::completeMgmtAgentAccess << count %x\n",fExpansionData->fNumberPendingMgtAgentOrbs));
+	}
+}
+
+// clearMgmtAgentAccess
+//
+//
+
+void IOFireWireSBP2Target::cancelMgmtAgentAccess( IOFWCommand * mgmtOrbCommand )
+{
+	// should only have one instance of a given command in this list, but I'll use a loop for good measure.
+	
+	int index;
+	while( (index = fExpansionData->fPendingMgtAgentCommands->getNextIndexOfObject( mgmtOrbCommand, 0 )) != -1 )
+	{
+		fExpansionData->fPendingMgtAgentCommands->removeObject( index );		
+	}
+}
+
+// clearMgmtAgentAccess
+//
+//
+
+void IOFireWireSBP2Target::clearMgmtAgentAccess( )
+{
+	if( fExpansionData && fExpansionData->fPendingMgtAgentCommands )
+	{
+		IOFWAsyncCommand *				mgmtOrbCommand;
+		
+		FWKLOG(("IOFireWireSBP2Target::clearMgmtAgentAccess\n",mgmtOrbCommand));
+			
+		while( (mgmtOrbCommand = (IOFWAsyncCommand *)fExpansionData->fPendingMgtAgentCommands->getObject( 0 ))  )
+		{
+			mgmtOrbCommand->retain();
+			
+			fExpansionData->fPendingMgtAgentCommands->removeObject( 0 ) ;
+			
+			FWKLOG(("IOFireWireSBP2Target::clearMgmtAgentAccess, failing command %08x\n",mgmtOrbCommand));
+			mgmtOrbCommand->gotPacket( kFWResponseBusResetError, NULL, 0 );
+		
+			mgmtOrbCommand->release();
+		}
+		
+		fExpansionData->fNumberPendingMgtAgentOrbs = 0;
+	}
 }

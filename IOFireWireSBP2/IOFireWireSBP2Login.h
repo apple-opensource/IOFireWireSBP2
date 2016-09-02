@@ -38,7 +38,8 @@
 // login option flags
 enum
 {
-    kFWSBP2ExclusiveLogin = (1 << 5)
+	kFWSBP2DontSynchronizeMgmtAgent = (1 << 0),
+    kFWSBP2ExclusiveLogin 			= (1 << 5)
 };
 
 // notification events
@@ -50,8 +51,8 @@ enum
     kFWSBP2NormalCommandReset	= 9
 };
 
-#define kIOMessageFWSBP2ReconnectComplete	iokit_fw_err(1000)
-#define kIOMessageFWSBP2ReconnectFailed		iokit_fw_err(1001)
+#define kIOMessageFWSBP2ReconnectComplete	iokit_fw_err(0x3E8)
+#define kIOMessageFWSBP2ReconnectFailed		iokit_fw_err(0x3E9)
 
 /*! 
     @typedef FWSBP2LoginResponse
@@ -244,6 +245,7 @@ class IOFireWireSBP2Login : public OSObject
 
 	friend class IOFireWireSBP2ORB;
 	friend class IOFireWireSBP2LUN;
+	friend class IOFireWireSBP2UserClient;
 	
 protected:
 
@@ -265,7 +267,8 @@ protected:
         kLoginStateLoggingIn	= 1,
         kLoginStateConnected	= 2,
         kLoginStateReconnect	= 3,
-        kLoginStateLoggingOut	= 4
+        kLoginStateLoggingOut	= 4,
+		kLoginStateTerminated	= 5
     };
 
     // rom keys
@@ -449,7 +452,8 @@ protected:
     bool					fFetchAgentWriteCommandInUse;
 	FWSBP2FetchAgentWriteCallback 	fFetchAgentWriteCompletion;
 	void * 							fFetchAgentWriteRefCon;
-
+	IOFireWireSBP2ORB *		fORBToWrite;
+	
     OSSet *					fORBSet;
     OSIterator *			fORBSetIterator;
  
@@ -460,6 +464,20 @@ protected:
 	IOMemoryDescriptor *	fPasswordDescriptor;
 
 	bool fSuspended;
+	
+	UInt32					fLoginRetryDelay;
+	UInt32					fLoginRetryCount;
+	UInt32					fLoginRetryMax;
+	IOFWDelayCommand *		fLoginRetryTimeoutCommand;
+    bool					fLoginRetryTimeoutTimerSet;
+	IOFireWireSBP2Target * 	fTarget;
+	
+	bool					fUnsolicitedStatusEnableRequested;
+	
+	IOFWDelayCommand *		fReconnectRetryTimeoutCommand;
+    bool					fReconnectRetryTimeoutTimerSet;	
+
+	int						fCriticalSectionCount;
 	
 	// init / destroy
     virtual IOReturn getUnitInformation( void );
@@ -595,7 +613,20 @@ protected:
 	UInt32 							fSetBusyTimeoutBuffer;
 	FWAddress 						fSetBusyTimeoutAddress;
 	IOFWWriteQuadCommand *			fSetBusyTimeoutCommand;
+	
+	bool							fInCriticalSection;
 
+	UInt16					fLocalNodeID;
+	bool					fFastStartSupported;
+	UInt32					fFastStartOffset;
+	UInt32					fFastStartMaxPayload;
+	
+	UInt32					fUserLoginGeneration;
+	bool					fUserLoginGenerationSet;
+	
+	IOFWDelayCommand *		fFetchAgentRetryTimerCommand;
+    bool					fFetchAgentRetryTimerSet;	
+	
 	virtual IOReturn executeSetBusyTimeout( void );
 	static void setBusyTimeoutCompleteStatic( void *refcon, IOReturn status, IOFireWireNub *device, IOFWCommand *fwCmd );
 	virtual void setBusyTimeoutComplete( IOReturn status, IOFireWireNub *device, IOFWCommand *fwCmd );
@@ -615,6 +646,13 @@ protected:
 	virtual void removeLogin( void );
 	virtual IOFireWireSBP2Target * getTarget( void );
 	
+	UInt32		fARDMAMax;
+	bool		fPhysicalAccessEnabled;
+
+	bool					fLoginStatusReceived;
+	FWSBP2StatusBlock		fLoginStatusBlock;
+	UInt32					fLoginStatusBlockLen;
+		
 private:
 
     OSMetaClassDeclareReservedUnused(IOFireWireSBP2Login, 1);
@@ -841,9 +879,10 @@ public:
     /*!
 		@function setLoginFlags
 		@abstract Sets login configuration flags.
-		@discussion Configures the login behavior according to the provided flags.  Currently only one 
-        flag is defined for this API.  kFWSBP2ExclusiveLogin sets the exclusive login bit in the 
-        login ORB.
+		@discussion Configures the login behavior according to the provided flags.  Currently two 
+        flags are defined for this API.  kFWSBP2ExclusiveLogin sets the exclusive login bit in the 
+        login ORB. kFWSBP2DontSynchronizeMgmtAgent allows simultaneous logins or reconnects to LUNs
+        with a common management agent (ie LUNs in the same unit directory).
         @param loginFlags the login configuration flags.
 	*/
     
@@ -977,12 +1016,57 @@ public:
     /*! 
         @function release
         @abstract Primary implementation of the release mechanism.
-        @discussion See OSObject.h for more information. 
-        @param when When retainCount == when then call free(). 
+        @discussion See OSObject.h for more information.  When retainCount == when then call free(). 
     */
     
     virtual void release() const;
+	
+	/*! 
+        @function setLoginRetryCountAndDelayTime
+        @abstract Sets login retry behavior.
+        @discussion Sets login retry behavior.
+        @param retryCount number of times to retry logins
+		@param uSecs delay time in microseconds between login retries
+    */
+	
+	virtual void setLoginRetryCountAndDelayTime( UInt32 retryCount, UInt32 uSecs );
+	
+protected:
+	virtual IOReturn initialExecuteLogin( void );
+	virtual void startLoginRetryTimer( void );
+	virtual void stopLoginRetryTimer( void );
+	static void loginRetryTimeoutStatic( void *refcon, IOReturn status,
+										 IOFireWireBus *bus, IOFWBusCommand *fwCmd );
+	virtual void loginRetryTimeout( IOReturn status, IOFireWireBus *bus, IOFWBusCommand *fwCmd);
 
+	virtual void startReconnectRetryTimer( void );
+	virtual void stopReconnectRetryTimer( void );
+	static void reconnectRetryTimeoutStatic( void *refcon, IOReturn status, IOFireWireBus *bus, IOFWBusCommand *fwCmd );
+	virtual void reconnectRetryTimeout( IOReturn status, IOFireWireBus *bus, IOFWBusCommand *fwCmd );
+
+	virtual bool isORBAppended( IOFireWireSBP2ORB * orb );
+	virtual void setORBIsAppended( IOFireWireSBP2ORB * orb, bool state );
+
+public:    
+	virtual void setAddressLoForLoginORBAndResponse( UInt32 addressLoORB, UInt32 addresLoResponse );
+	
+	virtual void setLoginGeneration( UInt32 generation );
+	virtual void clearLoginGeneration( void );
+
+protected:
+	void startFetchAgentRetryTimer( UInt32 duration );
+	void stopFetchAgentRetryTimer( void );
+	static void fetchAgentRetryTimerStatic( void *refcon, IOReturn status, IOFireWireBus *bus, IOFWBusCommand *fwCmd );
+	void fetchAgentRetryTimer( IOReturn status, IOFireWireBus *bus, IOFWBusCommand *fwCmd );
+	
+	void terminateNotify( void );
+	void processLoginWrite( void );
+
+public:
+	
+	bool	isPhysicalAccessEnabled( void );
+	UInt32	getARDMMax( void );
+	
 private:
     
     OSMetaClassDeclareReservedUnused(IOFireWireSBP2Login, 6);
